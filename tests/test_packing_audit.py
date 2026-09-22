@@ -1,5 +1,8 @@
 """End-to-end tests for the /packing-audit endpoint."""
 
+import json
+from decimal import Decimal
+
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -264,6 +267,119 @@ def test_string_max_weight_is_exact_decimal():
     assert entry["max_weight"] == 1.5
     assert entry["over_limit"] is True
     assert entry["remaining_capacity"] == -0.5
+
+
+# -------------------------------------------------------------- huge capacity
+
+
+def test_huge_capacity_keeps_every_digit_of_remaining_capacity():
+    # 1e60 overflows the fixed 50-digit arithmetic precision: the working
+    # precision must follow the capacity's magnitude, not truncate it.
+    resp = audit([container("BIG", "1e60", [item("S1", "3103002000")])])  # 2 kg
+    assert resp.status_code == 200
+    # every weight field is a fixed-point six-place JSON number, never an
+    # exponent form, and the remainder keeps every digit of 1e60 - 2
+    assert '"max_weight":1' + "0" * 60 + ".000000" in resp.text
+    assert '"direct_weight":2.000000' in resp.text
+    assert '"total_weight":2.000000' in resp.text
+    assert '"remaining_capacity":' + "9" * 59 + "8.000000" in resp.text
+    entry = resp.json()["containers"][0]
+    assert entry["over_limit"] is False
+
+
+def test_huge_capacity_round_trips_without_precision_loss():
+    resp = audit([container("BIG", "1e60", [item("S1", "3103002000")])])
+    assert resp.status_code == 200
+    body = json.loads(resp.text, parse_float=Decimal)
+    entry = body["containers"][0]
+    assert entry["max_weight"] == Decimal("1E+60")
+    assert entry["direct_weight"] == 2
+    assert entry["total_weight"] == 2
+    assert entry["remaining_capacity"] == Decimal("9" * 59 + "8")
+    assert entry["over_limit"] is False
+
+
+def test_huge_json_number_capacity_is_exact():
+    # 1e60 as a JSON number must arrive as the exact Decimal, not float noise
+    resp = client.post(
+        "/packing-audit",
+        json={
+            "containers": [
+                {
+                    "container_id": "BIG",
+                    "max_weight": 1e60,
+                    "items": [item("S1", "3103002000")],
+                }
+            ]
+        },
+    )
+    assert resp.status_code == 200
+    assert '"max_weight":1' + "0" * 60 + ".000000" in resp.text
+    assert '"remaining_capacity":' + "9" * 59 + "8.000000" in resp.text
+
+
+def test_huge_capacity_empty_container_renders_exactly():
+    resp = audit([container("BIG", "1e60")])
+    assert resp.status_code == 200
+    entry = resp.json()["containers"][0]
+    assert entry["direct_weight"] == 0.0
+    assert entry["total_weight"] == 0.0
+    assert entry["over_limit"] is False
+    assert '"total_weight":0.000000' in resp.text
+    assert '"max_weight":1' + "0" * 60 + ".000000" in resp.text
+    assert '"remaining_capacity":1' + "0" * 60 + ".000000" in resp.text
+
+
+def test_huge_capacity_rolls_up_nested_containers():
+    resp = audit(
+        [
+            container("PAL", "1e60", [item("P1", "3103002000")]),  # 2 kg direct
+            container(
+                "A",
+                100,
+                [item("A1", "3103003000", gtin=GTIN_PRODUCT)],  # 3 kg
+                parent_id="PAL",
+            ),
+        ]
+    )
+    assert resp.status_code == 200
+    entries = by_id(resp.json())
+    # the child's ordinary capacity behaves exactly as before
+    assert entries["A"]["total_weight"] == 3.0
+    assert entries["A"]["remaining_capacity"] == 97.0
+    assert entries["A"]["over_limit"] is False
+    # the root's remainder keeps every digit of 1e60 - (2 + 3)
+    assert entries["PAL"]["total_weight"] == 5.0
+    assert entries["PAL"]["recursive_item_count"] == 2
+    assert entries["PAL"]["over_limit"] is False
+    assert '"remaining_capacity":' + "9" * 59 + "5.000000" in resp.text
+    assert '"remaining_capacity":97.000000' in resp.text
+
+
+def test_over_limit_boundary_beyond_default_precision():
+    # 51 significant digits: just below/above the 2 kg load at a digit the
+    # fixed 50-digit arithmetic cannot see; the exact value decides.
+    just_under = "1." + "9" * 50  # 2 - 1e-50
+    just_over = "2." + "0" * 49 + "1"  # 2 + 1e-50
+    resp = audit(
+        [
+            container("UNDER", just_under, [item("S1", "3103002000")]),
+            container(
+                "OVER", just_over, [item("S2", "3103002000", gtin=GTIN_PRODUCT)]
+            ),
+        ]
+    )
+    assert resp.status_code == 200
+    entries = by_id(resp.json())
+    assert entries["UNDER"]["over_limit"] is True
+    assert entries["OVER"]["over_limit"] is False
+    # both capacities render as 2.000000 at six places, but the remainders
+    # keep their exact sign: -1e-50 -> -0.000000, +1e-50 -> 0.000000
+    assert '"remaining_capacity":-0.000000' in resp.text
+    body = json.loads(resp.text, parse_float=Decimal)
+    exact = {c["container_id"]: c for c in body["containers"]}
+    assert exact["UNDER"]["remaining_capacity"].is_signed()
+    assert not exact["OVER"]["remaining_capacity"].is_signed()
 
 
 # ------------------------------------------------------------ structural errors

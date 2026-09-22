@@ -45,8 +45,12 @@ the totals of its child containers, and the same recursion gives the
 recursive item count.  A container whose (exact, unrounded) total
 exceeds ``max_weight`` is flagged ``over_limit``; the audit still
 returns every container, with a negative ``remaining_capacity`` for
-the overloaded ones.  Rounding to six places happens only when the
-response is rendered.
+the overloaded ones.  The working precision follows the largest
+``max_weight`` (one digit per integer digit on top of
+:data:`app.summary.ARITHMETIC_PRECISION`), so ``remaining_capacity``
+keeps every digit of ``max_weight - total_weight`` even for capacities
+far beyond the default precision such as 1e60.  Rounding to six places
+happens only when the response is rendered.
 """
 
 from __future__ import annotations
@@ -284,6 +288,25 @@ def _check_cycle(parent_of: list[int | None]) -> None:
             state[settled] = 2
 
 
+def _arithmetic_precision(
+    containers: list[tuple[str, str | None, Decimal, list[str]]],
+) -> int:
+    """Context precision for the audit arithmetic.
+
+    Subtracting the rolled-up load from a container's capacity must stay
+    exact however large ``max_weight`` is: on top of the usual headroom,
+    allow one digit per integer digit of the largest capacity so that
+    e.g. 1e60 - 2 kg keeps its exact remaining capacity instead of
+    rounding the load away.
+    """
+    precision = ARITHMETIC_PRECISION
+    for _container_id, _parent_id, max_weight, _items in containers:
+        precision = max(
+            precision, max_weight.adjusted() + 1 + ARITHMETIC_PRECISION
+        )
+    return precision
+
+
 def audit(
     target_unit: str, containers: list[tuple[str, str | None, Decimal, list[str]]]
 ) -> dict:
@@ -296,7 +319,7 @@ def audit(
     unrounded :class:`Decimal` already expressed in the target unit.
     """
     with localcontext() as ctx:
-        ctx.prec = ARITHMETIC_PRECISION
+        ctx.prec = _arithmetic_precision(containers)
 
         # -- unique container ids (parents refer to these) --
         index_of: dict[str, int] = {}
