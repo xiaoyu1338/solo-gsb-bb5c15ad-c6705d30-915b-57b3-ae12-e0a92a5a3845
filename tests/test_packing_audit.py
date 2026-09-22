@@ -3,7 +3,6 @@
 from fastapi.testclient import TestClient
 
 from app.main import app
-
 client = TestClient(app)
 
 GS = "\x1d"
@@ -264,6 +263,105 @@ def test_string_max_weight_is_exact_decimal():
     assert entry["max_weight"] == 1.5
     assert entry["over_limit"] is True
     assert entry["remaining_capacity"] == -0.5
+
+
+# ---------------------------------------------- huge-capacity exact arithmetic
+
+
+def test_huge_capacity_keeps_every_digit_of_the_load():
+    # 1e60 vastly exceeds the default 50-digit arithmetic precision; a
+    # fixed-context subtraction would round the 2 kg load away entirely.
+    huge = "1" + "0" * 60
+    resp = audit([container("HUGE", huge, [item("S1", "3103002000")])])
+    assert resp.status_code == 200
+    entry = resp.json()["containers"][0]
+    assert entry["direct_weight"] == 2.0
+    assert entry["total_weight"] == 2.0
+    assert entry["over_limit"] is False
+    # Every one of the capacity's 60 integer digits is preserved: a fixed
+    # 50-digit context renders the remaining capacity as exactly 1e60.
+    assert f'"max_weight":{huge}.000000' in resp.text
+    assert f'"remaining_capacity":{"9" * 59}8.000000' in resp.text
+    assert f'"remaining_capacity":{huge}.000000' not in resp.text
+
+
+def test_huge_capacity_empty_container_is_unaffected():
+    huge = "1" + "0" * 60
+    resp = audit([container("HUGE", huge, [])])
+    assert resp.status_code == 200
+    entry = resp.json()["containers"][0]
+    assert entry["direct_weight"] == 0.0
+    assert entry["total_weight"] == 0.0
+    assert entry["over_limit"] is False
+    assert f'"max_weight":{huge}.000000' in resp.text
+    assert f'"remaining_capacity":{huge}.000000' in resp.text
+
+
+def test_huge_capacity_with_fractional_tail_keeps_every_digit():
+    # A capacity of 1e60 - 0.5 carries 61 significant digits; the empty
+    # container's remaining capacity must preserve the .5 instead of
+    # rounding up to 1e60 at the fixed 50-digit arithmetic context.
+    cap = "9" * 60 + ".5"
+    resp = audit([container("HUGE", cap, [])])
+    assert resp.status_code == 200
+    entry = resp.json()["containers"][0]
+    assert entry["over_limit"] is False
+    assert f'"remaining_capacity":{cap}00000' in resp.text
+    assert '"remaining_capacity":' + "1" + "0" * 60 + ".000000" not in resp.text
+
+
+def test_huge_capacity_with_fractional_tail_keeps_lb_conversion_digits():
+    # In lb target the 2 kg load converts to a 50-significant-digit factor,
+    # so 1e60 minus that load needs over a hundred digits to stay exact.
+    huge = "1" + "0" * 60
+    resp = audit(
+        [container("HUGE", huge, [item("S1", "3103002000")])], target_unit="lb"
+    )
+    assert resp.status_code == 200
+    entry = resp.json()["containers"][0]
+    assert entry["over_limit"] is False
+    token = resp.text.split('"remaining_capacity":')[1].split(",")[0]
+    assert token != huge + ".000000"  # the load must not round away
+    assert token.endswith("5.590755")  # 1e60 - 4.409245... lb
+
+
+def test_huge_root_keeps_rolled_up_child_load_exact():
+    huge = "1" + "0" * 60
+    resp = audit(
+        [
+            container("ROOT", huge, []),
+            container("CHILD", 100, [item("C1", "3103002000")], parent_id="ROOT"),
+        ]
+    )
+    assert resp.status_code == 200
+    entries = by_id(resp.json())
+    assert entries["CHILD"]["total_weight"] == 2.0
+    assert entries["ROOT"]["direct_weight"] == 0.0
+    assert entries["ROOT"]["total_weight"] == 2.0
+    assert entries["ROOT"]["recursive_item_count"] == 1
+    assert entries["ROOT"]["over_limit"] is False
+    assert f'"remaining_capacity":{"9" * 59}8.000000' in resp.text
+    assert f'"remaining_capacity":{huge}.000000' not in resp.text
+
+
+def test_over_limit_uses_exact_value_when_overload_is_below_six_places():
+    # Capacity is 2 kg minus 1e-10: the 2 kg load overshoots by 1e-10,
+    # which half-even six-place rounding renders as an exact match.
+    resp = audit([container("A", "1.9999999999", [item("S1", "3103002000")])])
+    assert resp.status_code == 200
+    entry = resp.json()["containers"][0]
+    assert entry["over_limit"] is True
+    assert '"remaining_capacity":-0.000000' in resp.text
+
+
+def test_six_place_rendering_hides_positive_remainder_without_flagging_over():
+    # 2 kg against a capacity of 2 kg + 1e-7 fits exactly on the unrounded
+    # values even though the rendered remaining capacity rounds to zero.
+    resp = audit([container("A", "2.0000001", [item("S1", "3103002000")])])
+    assert resp.status_code == 200
+    entry = resp.json()["containers"][0]
+    assert entry["over_limit"] is False
+    assert '"remaining_capacity":0.000000' in resp.text
 
 
 # ------------------------------------------------------------ structural errors

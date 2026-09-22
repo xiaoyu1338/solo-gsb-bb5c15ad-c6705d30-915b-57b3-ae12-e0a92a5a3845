@@ -47,6 +47,16 @@ exceeds ``max_weight`` is flagged ``over_limit``; the audit still
 returns every container, with a negative ``remaining_capacity`` for
 the overloaded ones.  Rounding to six places happens only when the
 response is rendered.
+
+Capacity magnitudes are unbounded (``max_weight`` may be something
+like ``1E+60``), so the capacity-minus-total subtraction runs in its
+own context widened to exactly the digit count the two operands span:
+one significant digit per integer digit of the larger operand plus
+every fractional digit of the more precise one.  That keeps every
+digit of the load instead of rounding it away at the audit's fixed
+50 significant figures; the item-weight arithmetic itself stays on
+that fixed context, and six-place rounding happens only when the
+response is rendered.
 """
 
 from __future__ import annotations
@@ -60,6 +70,33 @@ REQUIRED_AI_TEXT = (
     "exactly one AI 01 (GTIN), exactly one AI 21 (serial number), "
     "and exactly one weight AI 310n/320n"
 )
+
+
+def _exact_difference(capacity: Decimal, total: Decimal) -> Decimal:
+    """Return ``capacity - total`` without any precision rounding.
+
+    A fixed 50-digit context is exact for item totals (six source digits
+    times the eight-digit conversion factor) but cannot hold every digit
+    of a capacity as large as ``1E+60`` minus a small load.  The operands
+    dictate the context width: one significant digit per integer digit of
+    the larger operand (``adjusted() + 1``; zero needs none) plus one per
+    fractional digit of the more precise one.  With that width the
+    subtraction -- and therefore the ``over_limit`` sign test -- keeps
+    every digit of both operands regardless of their magnitudes.
+    """
+    if capacity.is_zero():
+        return -total
+    if total.is_zero():
+        return capacity
+    integer_digits = max(capacity.adjusted(), total.adjusted()) + 1
+    if integer_digits <= 0:
+        integer_digits = 1
+    fractional_digits = max(-capacity.as_tuple().exponent, -total.as_tuple().exponent, 0)
+    with localcontext() as ctx:
+        ctx.prec = max(
+            ARITHMETIC_PRECISION, integer_digits + fractional_digits
+        )
+        return capacity - total
 
 
 class PackingAuditError(Exception):
@@ -416,6 +453,11 @@ def audit(
             containers
         ):
             total_weight = total_weights[index]
+            # The difference is computed in an operand-sized context so a
+            # capacity such as 1E+60 keeps every digit of the loaded
+            # weight; over_limit is then the exact sign of that value
+            # rather than the sign of its six-place rendering.
+            remaining_capacity = _exact_difference(max_weight, total_weight)
             results.append(
                 {
                     "container_id": container_id,
@@ -424,10 +466,10 @@ def audit(
                     "unit": target_unit,
                     "direct_weight": direct_weights[index],
                     "total_weight": total_weight,
-                    "remaining_capacity": max_weight - total_weight,
+                    "remaining_capacity": remaining_capacity,
                     "direct_item_count": len(items),
                     "recursive_item_count": recursive_counts[index],
-                    "over_limit": total_weight > max_weight,
+                    "over_limit": remaining_capacity < 0,
                 }
             )
 
